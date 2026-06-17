@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Callable
 import contextvars
 import inspect
+import textwrap
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from crewai.flow.flow_definition import (
@@ -15,9 +16,11 @@ from crewai.flow.flow_definition import (
     FlowEachActionDefinition,
     FlowEachInnerActionDefinition,
     FlowExpressionActionDefinition,
+    FlowScriptActionDefinition,
     FlowToolActionDefinition,
 )
 from crewai.flow.runtime._expressions import evaluate_expression, render_with_block
+from crewai.flow.runtime._outputs import outputs_by_name
 from crewai.flow.runtime._refs import InvalidRefError, resolve_ref
 
 
@@ -140,6 +143,37 @@ class ExpressionAction:
         )
 
 
+class ScriptAction:
+    definition_type = FlowScriptActionDefinition
+
+    def __init__(self, flow: Flow[Any], definition: FlowScriptActionDefinition) -> None:
+        self.flow = flow
+        self.definition = definition
+        self.handler = self._compile_handler()
+
+    def run(self, *args: Any, **kwargs: Any) -> Any:
+        local_context = _pop_local_context(kwargs)
+        return self.handler(
+            state=self.flow.state,
+            outputs=outputs_by_name(
+                self.flow._method_outputs,
+                local_outputs=local_context.get("outputs") if local_context else None,
+            ),
+            input=args[0] if args else None,
+            item=local_context.get("item") if local_context else None,
+        )
+
+    def _compile_handler(self) -> Callable[..., Any]:
+        namespace: dict[str, Any] = {
+            "__name__": f"crewai.flow.script.{self.flow._definition.name}",
+        }
+        source = _script_function_source(self.definition.code)
+        exec(  # nosec B102 # noqa: S102
+            compile(source, namespace["__name__"], "exec"), namespace
+        )
+        return cast(Callable[..., Any], namespace["__flow_script__"])
+
+
 class EachAction:
     definition_type = FlowEachActionDefinition
 
@@ -199,6 +233,7 @@ _ACTION_TYPES: tuple[_ActionType, ...] = (
     ToolAction,
     CrewAction,
     ExpressionAction,
+    ScriptAction,
 )
 
 
@@ -240,3 +275,14 @@ def _pop_local_context(kwargs: dict[str, Any]) -> LocalContext | None:
     if not isinstance(local_context, dict):
         raise TypeError("flow definition local context must be a mapping")
     return cast(LocalContext, local_context)
+
+
+def _script_function_source(code: str) -> str:
+    body = code if code.strip() else "pass"
+    source = (
+        "def __flow_script__(state, outputs, input, item):\n"
+        f"{textwrap.indent(body, '    ')}"
+    )
+    if not source.endswith("\n"):
+        source += "\n"
+    return source
